@@ -1,0 +1,12 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.coverage
+.venv/
+venv/
+wandb/
+
+# Local model weights and full per-query caches exceed GitHub's file limits.
+checkpoints/
+artifacts/
+results/
