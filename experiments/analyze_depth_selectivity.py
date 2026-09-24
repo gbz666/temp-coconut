@@ -10,6 +10,8 @@ import matplotlib.pyplot as plt
 from matplotlib.colors import TwoSlopeNorm
 import numpy as np
 
+READOUT_CONDITIONS = ['C4', 'only_P1', 'only_P2', 'only_P3', 'only_P4']
+
 
 def graph_values(rows, getter):
     values = defaultdict(list)
@@ -100,10 +102,12 @@ def main():
     rows = [json.loads(l) for l in (p / 'queries.jsonl').read_text(encoding='utf-8').splitlines()]
     originals = [json.loads(l) for l in (p / 'originals.jsonl').read_text(encoding='utf-8').splitlines()]
     graphs = json.loads((p / 'graphs.json').read_text())
-    conditions = list(rows[0]['results'])
+    conditions = [c for c in READOUT_CONDITIONS if c in rows[0]['results']]
+    if conditions != READOUT_CONDITIONS:
+        raise ValueError(f'Missing expected readout conditions: {sorted(set(READOUT_CONDITIONS) - set(conditions))}')
     summary = dict(weighting='Mean within graph (nodes and two candidate orders), then equal graphs; 5000 graph bootstrap samples.',
-                   native=est(originals, lambda r: r['results'][f'C{r["original_depth"]}']['correct']),
-                   native_n_correct=sum(r['results'][f'C{r["original_depth"]}']['correct'] for r in originals),
+                   native=est(originals, lambda r: r['results']['C4']['correct']),
+                   native_n_correct=sum(r['results']['C4']['correct'] for r in originals),
                    native_n_queries=len(originals), by_depth={}, paired={}, subsets={}, representation={})
     for d in range(1, 5):
         bucket = [r for r in rows if r['target_depth'] == d]
@@ -111,8 +115,6 @@ def main():
             c: {m: est(bucket, lambda r, c=c, m=m: r['results'][c][m]) for m in ('correct', 'forced_choice_correct', 'margin', 'outside_candidates')}
             for c in conditions})
         summary['paired'][str(d)] = {f'P{d}_minus_P{k}': paired(bucket, f'only_P{d}', f'only_P{k}') for k in range(1, 5) if k != d}
-        summary['paired'][str(d)].update(full_minus_dropP4=paired(bucket, 'C4', 'drop_P4'),
-                                          matched_stop_minus_C4=paired(bucket, f'C{d}', 'C4'))
         for name, predicate in dict(first=lambda r: r['target_slot'] == 0,
                                     second=lambda r: r['target_slot'] == 1,
                                     leaf_matched=lambda r: r['leaf_status_matched'],
@@ -120,7 +122,7 @@ def main():
             selected = [r for r in bucket if predicate(r)]
             summary['subsets'].setdefault(name, {})[str(d)] = {
                 c: est(selected, lambda r, c=c: r['results'][c]['forced_choice_correct'])
-                for c in ['C4', 'only_P1', 'only_P2', 'only_P3', 'only_P4']}
+                for c in conditions}
     records = representations(originals, graphs)
     (p / 'representation_per_query.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in records), encoding='utf-8')
     common_ids = set(metadata['selected_graphs'])
@@ -134,12 +136,11 @@ def main():
     (p / 'analysis.json').write_text(json.dumps(summary, indent=2), encoding='utf-8')
     plt.rcParams.update({'font.family': 'sans-serif', 'font.sans-serif': ['Microsoft YaHei', 'DejaVu Sans'],
                          'font.size': 10, 'axes.unicode_minus': False, 'pdf.fonttype': 42})
-    fig, axes = plt.subplots(1, 3, figsize=(16, 4.6), layout='constrained')
-    matrices = [np.array([[summary['by_depth'][str(d)]['conditions'][f'C{c}']['forced_choice_correct']['mean'] * 100 for c in range(7)] for d in range(1, 5)]),
-                np.array([[summary['by_depth'][str(d)]['conditions'][f'only_P{c}']['forced_choice_correct']['mean'] * 100 for c in range(1, 5)] for d in range(1, 5)]),
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4.6), layout='constrained')
+    matrices = [np.array([[summary['by_depth'][str(d)]['conditions'][c]['forced_choice_correct']['mean'] * 100 for c in conditions] for d in range(1, 5)]),
                 np.array([[summary['representation']['common_depth_graphs'][str(t)][f'cosine_depth{d}']['mean'] for d in range(1, 5)] for t in range(1, 5)])]
     for i, (ax, mat) in enumerate(zip(axes, matrices)):
-        im = (ax.imshow(mat, cmap='cividis', aspect='auto', vmin=0, vmax=100) if i < 2
+        im = (ax.imshow(mat, cmap='cividis', aspect='auto', vmin=0, vmax=100) if i == 0
               else ax.imshow(mat, cmap='RdBu_r', aspect='auto',
                              norm=TwoSlopeNorm(vmin=min(float(mat.min()), -.001), vcenter=0, vmax=float(mat.max()))))
         for y in range(mat.shape[0]):
@@ -147,15 +148,15 @@ def main():
                 val = mat[y, x]
                 red, green, blue, _ = im.cmap(im.norm(val))
                 luminance = .2126 * red + .7152 * green + .0722 * blue
-                ax.text(x, y, f'{val:.1f}' if i < 2 else f'{val:.3f}', ha='center', va='center',
+                ax.text(x, y, f'{val:.1f}' if i == 0 else f'{val:.3f}', ha='center', va='center',
                         color='white' if luminance < .48 else 'black')
         ax.set_yticks(range(4), ['1', '2', '3', '4'])
-        ax.set_ylabel('目标最短距离（跳）' if i < 2 else '反馈向量 z_t 的时间步 t')
-        ax.set_xticks(range(mat.shape[1]), [str(c) for c in range(7)] if i == 0 else [str(c) for c in range(1, 5)])
-        ax.set_xlabel(['latent 总步数 C', '唯一保留的 latent KV 位置 P', '被测节点的 BFS 深度'][i])
-        ax.set_title(['A  总步数 × 问题深度（二选一 %）', 'B  位置 × 问题深度（二选一 %）', 'C  原题同一轨迹的节点余弦分数'][i])
+        ax.set_ylabel('目标最短距离（跳）' if i == 0 else '反馈向量 z_t 的时间步 t')
+        ax.set_xticks(range(mat.shape[1]), ['C4'] + [str(c) for c in range(1, 5)] if i == 0 else [str(c) for c in range(1, 5)])
+        ax.set_xlabel(['4-step baseline / 唯一保留的 latent KV 位置', '被测节点的 BFS 深度'][i])
+        ax.set_title(['A  四步读出 × 问题深度（二选一 %）', 'B  原题同一轨迹的节点余弦分数'][i])
         fig.colorbar(im, ax=ax, shrink=.8)
-    fig.suptitle('Checkpoint350：深度选择性验证\n264 张图；6,566 个深度查询；图等权平均', fontsize=14)
+    fig.suptitle(f'Checkpoint350：深度选择性验证\n{len(metadata["selected_graphs"])} 张图；{len(rows):,} 个深度查询；图等权平均', fontsize=14)
     fig.savefig(p / 'depth_frontier.png', dpi=180)
     fig.savefig(p / 'depth_frontier.pdf')
     plt.close(fig)

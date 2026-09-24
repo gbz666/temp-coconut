@@ -1,8 +1,8 @@
-"""Checkpoint350 pilot: query depth, rollout length, slot readout, and node scores.
+"""Checkpoint350 pilot: depth-selective latent KV readout and node scores.
 
-No training. Original questions use their native 3/4-step budget for validation.
+No training. Original and counterfactual questions use a four-step trajectory.
 Counterfactual questions retain graph/root/negative and enumerate depths 1..4.
-z_t is the vector FED INTO latent slot P_t, t=1..6. In this curriculum the
+z_t is the vector FED INTO latent slot P_t, t=1..4. In this curriculum the
 root-position output predicts neighbor_1, so z_1 is compared against F_1.
 """
 import argparse
@@ -40,6 +40,24 @@ def module(name, path):
 
 def sha(path):
     return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def choose_device(explicit=None):
+    if explicit:
+        return explicit
+    if torch.cuda.is_available():
+        return 'cuda'
+    if torch.backends.mps.is_available():
+        return 'mps'
+    return 'cpu'
+
+
+def device_name(device):
+    if str(device).startswith('cuda'):
+        return torch.cuda.get_device_name()
+    if str(device) == 'mps':
+        return 'mps'
+    return 'cpu'
 
 
 def load(checkpoint, config_path=None, device='cuda'):
@@ -126,14 +144,14 @@ def metrics(logits, rows):
     return result
 
 
-def decode(base, kv, p, count, batch, keep=None, position=None, audit=False):
-    mask = torch.ones(batch, p + count + 1, device='cuda', dtype=torch.long)
+def decode(base, kv, p, count, batch, keep=None, audit=False, device='cuda'):
+    mask = torch.ones(batch, p + count + 1, device=device, dtype=torch.long)
     if keep is not None:
         mask[:, p:p + count] = 0
         for slot in keep:
             mask[:, p + slot] = 1
-    out = base(input_ids=torch.full((batch, 1), 37, device='cuda'), past_key_values=kv,
-               attention_mask=mask, position_ids=torch.full((batch, 1), p + (count if position is None else position), device='cuda'),
+    out = base(input_ids=torch.full((batch, 1), 37, device=device), past_key_values=kv,
+               attention_mask=mask, position_ids=torch.full((batch, 1), p + count, device=device),
                output_attentions=audit, use_cache=False)
     if audit and bool((mask == 0).any()):
         for a in out.attentions:
@@ -142,7 +160,7 @@ def decode(base, kv, p, count, batch, keep=None, position=None, audit=False):
 
 
 @torch.inference_mode()
-def evaluate(model, tokenizer, rows, output, representation=False, batch_size=24):
+def evaluate(model, tokenizer, rows, output, representation=False, batch_size=24, device='cuda'):
     base = model.base_causallm
     groups = defaultdict(list)
     for row in rows:
@@ -155,51 +173,35 @@ def evaluate(model, tokenizer, rows, output, representation=False, batch_size=24
             for offset in range(0, len(group), batch_size):
                 batch_rows = group[offset:offset + batch_size]
                 b = len(batch_rows)
-                ids = torch.tensor([tokenizer.encode(r['prompt'], add_special_tokens=False) for r in batch_rows], device='cuda')
+                ids = torch.tensor([tokenizer.encode(r['prompt'], add_special_tokens=False) for r in batch_rows], device=device)
                 assert ids.shape == (b, p)
                 prefix = base(input_ids=ids, attention_mask=torch.ones_like(ids),
-                              position_ids=torch.arange(p, device='cuda')[None].expand(b, -1),
+                              position_ids=torch.arange(p, device=device)[None].expand(b, -1),
                               output_hidden_states=True, use_cache=True)
                 out, kv = prefix, prefix.past_key_values
-                results, vectors, audit_logits = {}, [], {}
-                zero_logits = None
-                for count in range(7):
-                    logits = decode(base, kv, p, count, b)
-                    results[f'C{count}'] = metrics(logits, batch_rows)
-                    if count in (3, 4):
-                        audit_logits[count] = logits
-                    if count < 4:
-                        matched = decode(base, kv, p, count, b, position=4)
-                        results[f'C{count}_pos4'] = metrics(matched, batch_rows)
-                        if count == 0:
-                            zero_logits = matched
-                    if count == 4:
-                        for slot in range(4):
-                            logits = decode(base, kv, p, 4, b, keep=[slot], audit=done == 0)
-                            results[f'only_P{slot + 1}'] = metrics(logits, batch_rows)
-                        results['drop_P4'] = metrics(decode(base, kv, p, 4, b, keep=[0, 1, 2]), batch_rows)
-                        masked = decode(base, kv, p, 4, b, keep=[], audit=done == 0)
-                        torch.testing.assert_close(masked, zero_logits, atol=3e-5, rtol=3e-5)
-                        results['no_latent_readout'] = metrics(masked, batch_rows)
-                    if count == 6:
-                        break
+                results, vectors = {}, []
+                for count in range(4):
                     z = out.hidden_states[-1][:, -1:]
                     if representation:
                         vectors.append(z[:, 0])
                     out = base(inputs_embeds=z, past_key_values=kv,
-                               attention_mask=torch.ones(b, p + count + 1, device='cuda', dtype=torch.long),
-                               position_ids=torch.full((b, 1), p + count, device='cuda'),
+                               attention_mask=torch.ones(b, p + count + 1, device=device, dtype=torch.long),
+                               position_ids=torch.full((b, 1), p + count, device=device),
                                output_hidden_states=True, use_cache=True)
                     kv = out.past_key_values
+                logits = decode(base, kv, p, 4, b, device=device)
+                results['C4'] = metrics(logits, batch_rows)
+                for slot in range(4):
+                    slot_logits = decode(base, kv, p, 4, b, keep=[slot], audit=done == 0, device=device)
+                    results[f'only_P{slot + 1}'] = metrics(slot_logits, batch_rows)
                 if done == 0:
-                    for count in (3, 4):
-                        official_ids = torch.cat([ids[:1], torch.tensor([[33] * count + [37]], device='cuda')], dim=1)
-                        official = model(official_ids, torch.ones_like(official_ids), official_ids,
-                                         torch.arange(official_ids.shape[1], device='cuda')[None], inference_only=True)
-                        torch.testing.assert_close(official.logits[0, -1], audit_logits[count][0], atol=3e-5, rtol=3e-5)
-                        if representation:
-                            torch.testing.assert_close(official.inputs_embeds[0, p:p + count], torch.stack(vectors, dim=1)[0, :count], atol=3e-5, rtol=3e-5)
-                        audits.append(dict(latent_count=count, official_max_logit_diff=float((official.logits[0, -1] - audit_logits[count][0]).abs().max())))
+                    official_ids = torch.cat([ids[:1], torch.tensor([[33] * 4 + [37]], device=device)], dim=1)
+                    official = model(official_ids, torch.ones_like(official_ids), official_ids,
+                                     torch.arange(official_ids.shape[1], device=device)[None], inference_only=True)
+                    torch.testing.assert_close(official.logits[0, -1], logits[0], atol=3e-5, rtol=3e-5)
+                    if representation:
+                        torch.testing.assert_close(official.inputs_embeds[0, p:p + 4], torch.stack(vectors, dim=1)[0], atol=3e-5, rtol=3e-5)
+                    audits.append(dict(latent_count=4, official_max_logit_diff=float((official.logits[0, -1] - logits[0]).abs().max())))
                 if representation:
                     zs = torch.stack(vectors, dim=1)
                     emb = model.embedding.weight.detach()
@@ -227,6 +229,7 @@ def main():
     parser.add_argument('--original-graphs', type=int, default=0, help='0 uses all original test graphs')
     parser.add_argument('--batch-size', type=int, default=24)
     parser.add_argument('--seed', type=int, default=20260917)
+    parser.add_argument('--device', choices=['cuda', 'mps', 'cpu'], default=None)
     args = parser.parse_args()
     if args.output.exists():
         raise SystemExit('Choose a new output directory; existing results are never overwritten.')
@@ -239,29 +242,30 @@ def main():
     queries, originals, distances, selected, eligible = make_queries(data, args.graphs, args.seed)
     if args.original_graphs:
         originals = [q for q in originals if q['graph_id'] < args.original_graphs]
-    model, tokenizer = load(args.checkpoint, args.config)
+    device = choose_device(args.device)
+    model, tokenizer = load(args.checkpoint, args.config, device=device)
     args.output.mkdir(parents=True)
     metadata = dict(complete=False, started_utc=datetime.now(timezone.utc).isoformat(),
                     checkpoint=str(args.checkpoint), checkpoint_sha256=sha(args.checkpoint),
                     dataset=str(dataset), dataset_sha256=sha(dataset), script_sha256=sha(Path(__file__)),
                     seed=args.seed,
                     torch=torch.__version__, transformers=transformers.__version__,
-                    device=torch.cuda.get_device_name(), dtype='float32', model_layers=model.base_causallm.config.n_layer,
+                    device=device_name(device), dtype='float32', model_layers=model.base_causallm.config.n_layer,
                     selected_graphs=selected, eligible_graph_count=len(eligible), n_queries=len(queries),
                     n_original_queries=len(originals), bootstrap_unit='graph',
                     training=False, data_node_labels='pre-shuffled official test labels',
                     latent_definition='z_t is feedback input to P_t; z_1 is root-position output, compared with F_1',
                     readout='Prompt always visible. only_P uses four-step trajectory and fixed answer position P+4.',
-                    sweep='C0..C6 full readout at P+C; C0_pos4..C3_pos4 fix answer position P+4.',
+                    sweep='C4 full readout plus only_P1..only_P4 single-latent-KV readout.',
                     representation='Original query-conditioned trajectory only; no per-node prompt changes; tied LM head dot products and cosine.')
     (args.output / 'metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     (args.output / 'graphs.json').write_text(json.dumps([dict(graph_id=i, edges=s['edges'], root=s['root'],
           target=s['target'], neg_target=s['neg_target'], original_depth=len(s['steps']),
           distances=distances[i], optimal=s['neighbor_k']) for i, s in enumerate(data)], indent=2), encoding='utf-8')
     print(f'Originals {len(originals)}; depth queries {len(queries)} on {len(selected)} graphs', flush=True)
-    metadata['original_audits'] = evaluate(model, tokenizer, originals, args.output / 'originals.jsonl', True, args.batch_size)
-    metadata['query_audits'] = evaluate(model, tokenizer, queries, args.output / 'queries.jsonl', False, args.batch_size)
-    metadata.update(complete=True, finished_utc=datetime.now(timezone.utc).isoformat(), mask_zero_equivalence=True)
+    metadata['original_audits'] = evaluate(model, tokenizer, originals, args.output / 'originals.jsonl', True, args.batch_size, device=device)
+    metadata['query_audits'] = evaluate(model, tokenizer, queries, args.output / 'queries.jsonl', False, args.batch_size, device=device)
+    metadata.update(complete=True, finished_utc=datetime.now(timezone.utc).isoformat(), single_slot_mask_audit=True)
     (args.output / 'metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
     print('Complete: ' + str(args.output), flush=True)
 
