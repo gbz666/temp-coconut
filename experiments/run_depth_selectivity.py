@@ -6,14 +6,13 @@ z_t is the vector FED INTO latent slot P_t, t=1..4. In this curriculum the
 root-position output predicts neighbor_1, so z_1 is compared against F_1.
 """
 import argparse
-from collections import Counter, defaultdict, deque
+from collections import defaultdict
 from datetime import datetime, timezone
 import hashlib
 import importlib.util
 import json
 import os
 from pathlib import Path
-import random
 import time
 
 os.environ['USE_TF'] = '0'
@@ -22,6 +21,7 @@ import torch
 import torch.nn.functional as F
 import transformers
 from transformers import AutoConfig, AutoModelForCausalLM
+from prepare_eval_queries import DEFAULT_OUTPUT as DEFAULT_PREPARED
 
 HERE = Path(__file__).resolve().parent
 ROOT = HERE.parent
@@ -83,53 +83,9 @@ def load(checkpoint, config_path=None, device='cuda'):
     return model, tokenizer
 
 
-def graph_info(sample):
-    adj = defaultdict(list)
-    for a, b in sample['edges']:
-        adj[a].append(b)
-    dist = {sample['root']: 0}
-    queue = deque([sample['root']])
-    while queue:
-        a = queue.popleft()
-        for b in adj[a]:
-            if b not in dist:
-                dist[b] = dist[a] + 1
-                queue.append(b)
-    assert sample['neg_target'] not in dist
-    assert dist[sample['target']] == len(sample['steps'])
-    return dist
-
-
-def make_queries(data, max_graphs, seed):
-    distances = [graph_info(s) for s in data]
-    eligible = [i for i, d in enumerate(distances) if all(t in d.values() for t in range(1, 5))]
-    selected = sorted(np.random.default_rng(seed).choice(eligible, min(max_graphs, len(eligible)), replace=False).tolist()) if max_graphs else eligible
-    queries, originals = [], []
-    seen = set()
-    for i, (s, dist) in enumerate(zip(data, distances)):
-        key = (s['root'], tuple(sorted(map(tuple, s['edges']))))
-        assert key not in seen
-        seen.add(key)
-        edges = [e[:] for e in s['edges']]
-        random.Random(seed + i).shuffle(edges)
-        edge_text = '<eos> ' + ' | '.join(f'{a} {b}' for a, b in edges)
-        outdegree = Counter(a for a, b in edges)
-        for target in sorted(dist):
-            if not 1 <= dist[target] <= 4:
-                continue
-            for order in (0, 1):
-                candidates = [target, s['neg_target']] if order == 0 else [s['neg_target'], target]
-                prompt = f'{edge_text} [Q] {candidates[0]} {candidates[1]} [R] {s["root"]}'
-                row = dict(graph_id=i, query_id=f'g{i}_v{target}_o{order}', target=target,
-                           neg_target=s['neg_target'], root=s['root'], target_depth=dist[target],
-                           original_target=s['target'], original_depth=len(s['steps']), target_slot=order,
-                           leaf_status_matched=(outdegree[target] == 0) == (outdegree[s['neg_target']] == 0),
-                           prompt=prompt, prompt_length=len(prompt.split()))
-                if target == s['target']:
-                    originals.append(row)
-                if i in selected:
-                    queries.append(row)
-    return queries, originals, distances, selected, eligible
+def read_jsonl(path):
+    with path.open(encoding='utf-8') as stream:
+        return [json.loads(line) for line in stream]
 
 
 def metrics(logits, rows):
@@ -223,35 +179,37 @@ def evaluate(model, tokenizer, rows, output, representation=False, batch_size=24
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--prepared', type=Path, default=DEFAULT_PREPARED)
     parser.add_argument('--checkpoint', type=Path, default=CHECKPOINT_DIR / '2layer/checkpoint_350')
     parser.add_argument('--config', type=Path, help='Explicit model JSON; otherwise infer depth in the standard 8-head family')
-    parser.add_argument('--graphs', type=int, default=64, help='0 uses all common-depth graphs')
-    parser.add_argument('--original-graphs', type=int, default=0, help='0 uses all original test graphs')
     parser.add_argument('--batch-size', type=int, default=24)
-    parser.add_argument('--seed', type=int, default=20260917)
     parser.add_argument('--device', choices=['cuda', 'mps', 'cpu'], default=None)
     args = parser.parse_args()
     if args.output.exists():
         raise SystemExit('Choose a new output directory; existing results are never overwritten.')
     torch.set_num_threads(4)
-    torch.manual_seed(args.seed)
+    selection = json.loads((args.prepared / 'selection.json').read_text(encoding='utf-8'))
+    torch.manual_seed(selection['seed'])
     torch.backends.cuda.matmul.allow_tf32 = False
     torch.backends.cudnn.allow_tf32 = False
     dataset = DATA_DIR / 'prosqa_test_graph_4_coconut_shuffled_with_bfs.json'
-    data = json.loads(dataset.read_text(encoding='utf-8'))
-    queries, originals, distances, selected, eligible = make_queries(data, args.graphs, args.seed)
-    if args.original_graphs:
-        originals = [q for q in originals if q['graph_id'] < args.original_graphs]
+    if selection['dataset_sha256'] != sha(dataset):
+        raise ValueError('Prepared queries do not match the current test dataset')
+    queries = read_jsonl(args.prepared / 'queries.jsonl')
+    originals = read_jsonl(args.prepared / 'originals.jsonl')
+    selected = selection['selected_graphs']
+    if len(queries) != selection['n_queries'] or len(originals) != selection['n_original_queries']:
+        raise ValueError('Prepared query counts do not match selection.json')
     device = choose_device(args.device)
     model, tokenizer = load(args.checkpoint, args.config, device=device)
     args.output.mkdir(parents=True)
     metadata = dict(complete=False, started_utc=datetime.now(timezone.utc).isoformat(),
                     checkpoint=str(args.checkpoint), checkpoint_sha256=sha(args.checkpoint),
                     dataset=str(dataset), dataset_sha256=sha(dataset), script_sha256=sha(Path(__file__)),
-                    seed=args.seed,
+                    seed=selection['seed'],
                     torch=torch.__version__, transformers=transformers.__version__,
                     device=device_name(device), dtype='float32', model_layers=model.base_causallm.config.n_layer,
-                    selected_graphs=selected, eligible_graph_count=len(eligible), n_queries=len(queries),
+                    selected_graphs=selected, eligible_graph_count=selection['eligible_graph_count'], n_queries=len(queries),
                     n_original_queries=len(originals), bootstrap_unit='graph',
                     training=False, data_node_labels='pre-shuffled official test labels',
                     latent_definition='z_t is feedback input to P_t; z_1 is root-position output, compared with F_1',
@@ -259,9 +217,7 @@ def main():
                     sweep='C4 full readout plus only_P1..only_P4 single-latent-KV readout.',
                     representation='Original query-conditioned trajectory only; no per-node prompt changes; tied LM head dot products and cosine.')
     (args.output / 'metadata.json').write_text(json.dumps(metadata, indent=2), encoding='utf-8')
-    (args.output / 'graphs.json').write_text(json.dumps([dict(graph_id=i, edges=s['edges'], root=s['root'],
-          target=s['target'], neg_target=s['neg_target'], original_depth=len(s['steps']),
-          distances=distances[i], optimal=s['neighbor_k']) for i, s in enumerate(data)], indent=2), encoding='utf-8')
+    (args.output / 'graphs.json').write_bytes((args.prepared / 'graphs.json').read_bytes())
     print(f'Originals {len(originals)}; depth queries {len(queries)} on {len(selected)} graphs', flush=True)
     metadata['original_audits'] = evaluate(model, tokenizer, originals, args.output / 'originals.jsonl', True, args.batch_size, device=device)
     metadata['query_audits'] = evaluate(model, tokenizer, queries, args.output / 'queries.jsonl', False, args.batch_size, device=device)
